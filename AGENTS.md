@@ -1,0 +1,34 @@
+<!--
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: The Pumi Authors
+-->
+
+# Instructions for agents
+
+Read this file before you change anything in this repository. It is harness-neutral: CLAUDE.md only imports it, so every agent reads the same rules ([0091](https://github.com/getpumi/design/blob/main/decisions/0091-agents-md.md)). People who work here follow the same rules.
+
+This repository is the Pumi harness adapter for Claude Code ([0185](https://github.com/getpumi/design/blob/main/decisions/0185-claude-code-adapter-repository-and-no-gateway.md)). The design lives in [getpumi/design](https://github.com/getpumi/design). Read its [decisions index](https://github.com/getpumi/design/blob/main/decisions/README.md) and the [runner protocol](https://github.com/getpumi/design/blob/main/components/runner-protocol.md) before you change the adapter; the adapter contract is decided in [0158](https://github.com/getpumi/design/blob/main/decisions/0158-harness-adapter-process.md) to [0160](https://github.com/getpumi/design/blob/main/decisions/0160-adapter-output-schema-and-result.md). A change to the code that changes the design needs a decision there first. Do not rely on anything you seem to remember.
+
+The rules of the core repository's [AGENTS.md](https://github.com/getpumi/pumi/blob/main/AGENTS.md) hold here too: starting only Ready work, test first, follow-up work, dependency updates alone, the merge rule, the SPDX lines, no TODO or FIXME comments, no `//nolint` comments and the commit trailers. This file lists only what differs.
+
+## Layout
+
+- One Go module, `getpumi.dev/adapter-claude-code`. It requires the core's `api` module, `getpumi.dev/pumi/api`, at a pseudo-version of a commit on getpumi/pumi's main until that module has a release.
+- `cmd/adapter-claude-code` is the `main` package of the adapter.
+- `internal/adapter` reads the invocation, translates the capability list into Claude Code's settings, runs `claude -p` and writes the result.
+- `internal/checks` holds copies of the core's DCO, SPDX and nolint checks and the tests of the lint configuration, from getpumi/pumi at `11eb184`, with the import paths changed. The SPDX check lists no exempt path of the core.
+
+## Commands
+
+- `make build` compiles the module and writes the adapter to `bin/`.
+- `make test` runs `go test -race -shuffle=on -count=1 ./...` and writes a coverage profile to `coverage/`. The adapter's tests run it against a fake `claude`: the test binary, through a link named `claude` that the tests put first on the PATH.
+- `make lint`, `make dco RANGE=<base>..<head>`, `make spdx` and `make image` work as in the core repository. `make image` pushes to `ghcr.io/getpumi/adapter-claude-code-devcontainer`.
+
+The supported development environment is the repository's devcontainer, on Linux ([0087](https://github.com/getpumi/design/blob/main/decisions/0087-devcontainer-is-the-environment.md)).
+
+## Facts
+
+- Claude Code 2.1.330 (checked on 2026-11-23): `claude -p --output-format json` writes one JSON report when the run ends, also when it gets SIGINT, with `subtype` (such as `success`, `error_max_budget_usd` or `error_during_execution`), `is_error`, `total_cost_usd`, `modelUsage` (tokens per model) and, with `--json-schema`, `structured_output`. The top-level `usage` can be all zeros when `modelUsage` is not. It exits with status 1 when the budget runs out.
+- Claude Code 2.1.330: a prompt given as an argument after `--disallowedTools` or `--allowedTools` is read as a tool name, so the adapter gives the prompt on standard input. `--setting-sources ""` leaves out the user's settings and the settings in the working directory; a `.claude/settings.json` that allowed Bash and Write was ignored. With `--permission-mode dontAsk` and an `Edit(./src/**)` rule, Write created `src/a.txt` and was denied `b.txt`. Bash ran `cat README` with only `Bash(ls)` allowed, because Claude Code allows some read-only commands without a rule.
+- Cloud threads only: getpumi.dev is blocked, and proxy.golang.org answers for `getpumi.dev/pumi/api` with a pseudo-version, such as `https://proxy.golang.org/getpumi.dev/pumi/api/@v/11eb184.info`.
+- Cloud threads only: the golangci-lint on the PATH is an older release; download the version pinned in `.devcontainer/install-tools.sh` and check its SHA-256 before running `make lint` or `make test`.
