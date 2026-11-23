@@ -130,6 +130,10 @@ func Args(inv *harnessv1.Invocation) ([]string, error) {
 		"--settings", string(data),
 	}
 	if schema := inv.GetOutputSchema().GetJsonSchema(); schema != "" {
+		schema, err := claudeSchema(schema)
+		if err != nil {
+			return nil, err
+		}
 		args = append(args, "--json-schema", schema)
 	}
 	if cost := inv.GetBudget().GetCostMicrodollars(); cost > 0 {

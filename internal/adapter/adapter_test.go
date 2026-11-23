@@ -169,7 +169,7 @@ func checkRecord(t *testing.T, r record, workspace string) {
 	}
 	want := map[string]string{
 		"--output-format":      "json",
-		"--json-schema":        schema,
+		"--json-schema":        `{"properties":{"summary":{"type":"string"}},"required":["summary"],"type":"object"}`,
 		"--max-budget-usd":     "1.500000",
 		"--permission-mode":    "dontAsk",
 		"--permission-prompts": "none",

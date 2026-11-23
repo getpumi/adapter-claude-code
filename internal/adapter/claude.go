@@ -136,7 +136,12 @@ func wait(cmd *exec.Cmd, done <-chan error, grace time.Duration) error {
 
 // result builds the result from claude's report.
 func result(out []byte, waitErr error, stopped why, inv *harnessv1.Invocation, elapsed time.Duration, stderr io.Writer) *harnessv1.Result {
-	if waitErr != nil {
+	switch {
+	case stopped == stopRequested:
+		logf(stderr, "stopped claude on request")
+	case stopped == timeBudget:
+		logf(stderr, "stopped claude at the time budget of %d seconds", inv.GetBudget().GetSeconds())
+	case waitErr != nil:
 		logf(stderr, "claude exited: %v", waitErr)
 	}
 	seconds := int64(math.Ceil(elapsed.Seconds()))
@@ -152,7 +157,6 @@ func result(out []byte, waitErr error, stopped why, inv *harnessv1.Invocation, e
 	case stopped == stopRequested:
 		return &harnessv1.Result{Status: harnessv1.Result_STATUS_STOPPED, Usage: r.usage(seconds)}
 	case stopped == timeBudget:
-		logf(stderr, "the run reached its time budget of %d seconds", inv.GetBudget().GetSeconds())
 		return failed(&r, seconds)
 	case r.Subtype != "success" || r.IsError:
 		logf(stderr, "claude reported %s: %s", r.Subtype, strings.Join(r.Errors, "; "))
