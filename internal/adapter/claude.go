@@ -26,6 +26,7 @@ type report struct {
 	Subtype          string                `json:"subtype"`
 	IsError          bool                  `json:"is_error"`
 	Errors           []string              `json:"errors"`
+	Result           string                `json:"result"`
 	TotalCostUSD     float64               `json:"total_cost_usd"`
 	ModelUsage       map[string]modelUsage `json:"modelUsage"`
 	StructuredOutput json.RawMessage       `json:"structured_output"`
@@ -160,8 +161,14 @@ func result(out []byte, waitErr error, stopped why, inv *harnessv1.Invocation, e
 		return &harnessv1.Result{Status: harnessv1.Result_STATUS_STOPPED, Usage: r.usage(seconds)}
 	case stopped == timeBudget:
 		return failed(&r, seconds)
-	case r.Subtype != "success" || r.IsError:
+	case r.Subtype != "success":
 		logf(stderr, "claude reported %s: %s", r.Subtype, strings.Join(r.Errors, "; "))
+		return failed(&r, seconds)
+	case r.IsError:
+		// claude reports an error of the API, such as a call that the
+		// model gateway refused at the invocation's cap, with the subtype
+		// success and the error in result.
+		logf(stderr, "claude reported an error: %s", clip([]byte(r.Result)))
 		return failed(&r, seconds)
 	}
 	if inv.GetOutputSchema().GetJsonSchema() == "" {

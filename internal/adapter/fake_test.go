@@ -46,6 +46,9 @@ const (
 	fakeTokens = 2 + 167 + 812 + 10671
 )
 
+// fakeAPIError is the result of the fake's report in the mode apierror.
+const fakeAPIError = "API Error: 403 the Pumi model gateway refused the call: the invocation reached its token or cost cap"
+
 func fakeResult(subtype string, isError bool, output string) string {
 	structured := ""
 	if output != "" {
@@ -61,6 +64,9 @@ func fakeResult(subtype string, isError bool, output string) string {
 //
 //   - success: reports success with the structured output in FAKE_CLAUDE_OUTPUT
 //   - budget: reports that the budget ran out and exits with status 1
+//   - apierror: reports an error of the API, as claude does when the model
+//     gateway refuses a call at the invocation's cap, and exits with
+//     status 1
 //   - garbage: writes something that is not JSON
 //   - wait: waits for an interrupt, then reports an aborted run
 //   - ignore: ignores interrupts and waits to be killed
@@ -101,6 +107,11 @@ func fakeClaude() int {
 		_, _ = fmt.Println(fakeResult("success", false, os.Getenv(fakeOutput)))
 	case "budget":
 		_, _ = fmt.Println(fakeResult("error_max_budget_usd", true, ""))
+		return 1
+	case "apierror":
+		// Claude Code 2.1.331 reports a refused call with the subtype
+		// success, is_error true, no errors and the API's error in result.
+		_, _ = fmt.Println(strings.Replace(fakeResult("success", true, ""), `"result":"text"`, `"result":"`+fakeAPIError+`"`, 1))
 		return 1
 	case "garbage":
 		_, _ = fmt.Println("not JSON")
