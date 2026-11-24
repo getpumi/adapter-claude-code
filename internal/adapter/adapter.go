@@ -101,18 +101,23 @@ func readInvocation(stdin io.Reader) (*harnessv1.Invocation, <-chan struct{}, er
 //   - --permission-mode dontAsk and --permission-prompts none deny what no
 //     rule allows, with no prompt.
 //   - --no-session-persistence keeps no session to resume.
+//   - --model asks for the invocation's model role by name, such as
+//     "frontier", which the gateway maps to a model (decision 0233).
+//     Claude Code writes an unrecognized_model notice to its log for a name
+//     it does not know and runs as usual.
 //
-// The gateway is optional until E7 (decision 0185). With no gateway, claude
-// uses its own sign-in on the machine, which the adapter leaves as it
-// finds it in its environment. An invocation with a gateway is refused,
-// because the adapter cannot send claude's model calls through it before
-// E7 defines how.
+// Every agent run goes through the model gateway (decision 0226), so an
+// invocation without one, or without a model role, is refused. Env sets
+// claude's environment for the gateway.
 func Args(inv *harnessv1.Invocation) ([]string, error) {
 	if inv.GetInput().GetTask() == "" {
 		return nil, fmt.Errorf("%w: it has no task", ErrInvocation)
 	}
-	if inv.GetGateway() != nil {
-		return nil, fmt.Errorf("%w: it names a model gateway, which this adapter does not support until E7 (decision 0185)", ErrInvocation)
+	if err := checkGateway(inv.GetGateway()); err != nil {
+		return nil, err
+	}
+	if inv.GetModelRole() == "" {
+		return nil, fmt.Errorf("%w: it has no model role, which every agent run names (decision 0233)", ErrInvocation)
 	}
 	tools, settings := Translate(inv.GetCapabilities())
 	data, err := json.Marshal(settings)
@@ -123,6 +128,7 @@ func Args(inv *harnessv1.Invocation) ([]string, error) {
 		"-p",
 		"--output-format", "json",
 		"--no-session-persistence",
+		"--model", inv.GetModelRole(),
 		"--setting-sources", "",
 		"--permission-mode", "dontAsk",
 		"--permission-prompts", "none",

@@ -46,10 +46,49 @@ func setup(t *testing.T, mode string) (recordDir, workspace string) {
 	t.Setenv(fakeMode, mode)
 	t.Setenv(fakeRecord, recordDir)
 	t.Setenv(fakeOutput, `{"summary": "done"}`)
-	t.Setenv(fakeSignIn, "the sign-in of the machine")
-	t.Setenv("ANTHROPIC_BASE_URL", "the machine's own")
+	for name, value := range machine {
+		t.Setenv(name, value)
+	}
 	return recordDir, t.TempDir()
 }
+
+// machine is the person's own provider settings and credentials, which the
+// tests put in the adapter's environment.
+var machine = map[string]string{
+	"ANTHROPIC_BASE_URL":                     "https://elsewhere.example",
+	"ANTHROPIC_CUSTOM_HEADERS":               "X-Elsewhere: 1",
+	"ANTHROPIC_MODEL":                        "claude-opus-5-5",
+	"ANTHROPIC_SMALL_FAST_MODEL":             "claude-haiku-5-5",
+	"ANTHROPIC_DEFAULT_SONNET_MODEL":         "claude-sonnet-5-5",
+	"ANTHROPIC_VERTEX_BASE_URL":              "https://vertex.example",
+	"CLAUDE_CODE_SUBAGENT_MODEL":             "haiku",
+	"CLAUDE_CODE_USE_BEDROCK":                "1",
+	"CLAUDE_CODE_USE_VERTEX":                 "1",
+	"CLAUDE_CODE_USE_FOUNDRY":                "1",
+	"CLAUDE_CODE_USE_MANTLE":                 "1",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS":          "1",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD": "1",
+	"ANTHROPIC_API_KEY":                      "the person's API key",
+	"ANTHROPIC_AUTH_TOKEN":                   "the person's bearer token",
+	"CLAUDE_CODE_OAUTH_TOKEN":                "the person's sign-in",
+}
+
+// personSignIns are the variables of the person's own credentials, which stay
+// when the harness keeps its sign-in.
+var personSignIns = []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
+
+// personElsewhere are the variables of the person's provider settings that would
+// send claude's calls elsewhere, or to other models than the role, which
+// the adapter clears.
+var personElsewhere = []string{
+	"ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+	"ANTHROPIC_VERTEX_BASE_URL", "CLAUDE_CODE_SUBAGENT_MODEL",
+	"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+	"CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+}
+
+// token is the gateway's invocation token in the tests.
+const token = "pumi-invocation-token-0123456789"
 
 func invocation(workspace string) *harnessv1.Invocation {
 	return &harnessv1.Invocation{
@@ -64,7 +103,9 @@ func invocation(workspace string) *harnessv1.Invocation {
 		},
 		Budget:       &harnessv1.Usage{CostMicrodollars: 1_500_000},
 		Workspace:    workspace,
+		Gateway:      &harnessv1.Gateway{BaseUrl: "http://127.0.0.1:4100", Token: token, KeepsSignIn: true},
 		OutputSchema: &harnessv1.OutputSchema{Message: "pumi.workflow.v1.Summary", JsonSchema: schema},
+		ModelRole:    "frontier",
 	}
 }
 
@@ -148,11 +189,72 @@ func TestRunCompleted(t *testing.T) {
 	if usage.GetTokens() != fakeTokens || usage.GetCostMicrodollars() != 250_000 || usage.GetSeconds() < 1 {
 		t.Errorf("usage = %v, want %d tokens, 250000 microdollars and at least 1 second", usage, fakeTokens)
 	}
-	if !strings.Contains(stderr, "fake claude started") {
+	if !strings.Contains(stderr, "fake claude started") || !strings.Contains(stderr, "unrecognized_model") {
 		t.Errorf("the adapter's log does not hold claude's log:\n%s", stderr)
 	}
+	checkNoToken(t, stderr)
 
-	checkRecord(t, readRecord(t, recordDir), workspace)
+	r := readRecord(t, recordDir)
+	checkRecord(t, r, workspace)
+	checkGatewayEnv(t, r.Env)
+	if got, want := r.Env["ANTHROPIC_CUSTOM_HEADERS"], "X-Pumi-Token: "+token; got != want {
+		t.Errorf("ANTHROPIC_CUSTOM_HEADERS = %q, want %q", got, want)
+	}
+	for _, name := range personSignIns {
+		if got, want := r.Env[name], machine[name]; got != want {
+			t.Errorf("%s = %q, want the person's own %q, because the harness keeps its sign-in", name, got, want)
+		}
+	}
+}
+
+// TestRunWithAPIKeyInGateway runs an invocation whose gateway holds the
+// provider's API key, so that claude has no sign-in of its own and sends
+// the token as its credential (decision 0225).
+func TestRunWithAPIKeyInGateway(t *testing.T) {
+	recordDir, workspace := setup(t, "success")
+	inv := invocation(workspace)
+	inv.Gateway.KeepsSignIn = false
+	result, stderr, err := run(t, line(t, inv))
+	if err != nil {
+		t.Fatalf("Run: %v\n%s", err, stderr)
+	}
+	if result.GetStatus() != harnessv1.Result_STATUS_COMPLETED {
+		t.Errorf("status = %v, want completed\n%s", result.GetStatus(), stderr)
+	}
+	checkNoToken(t, stderr)
+	r := readRecord(t, recordDir)
+	checkGatewayEnv(t, r.Env)
+	if got := r.Env["ANTHROPIC_AUTH_TOKEN"]; got != token {
+		t.Errorf("ANTHROPIC_AUTH_TOKEN = %q, want the invocation token", got)
+	}
+	for _, name := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS"} {
+		if value, ok := r.Env[name]; ok {
+			t.Errorf("claude's environment has %s = %q, want it cleared", name, value)
+		}
+	}
+}
+
+// checkGatewayEnv checks that claude's environment sends its calls to the
+// gateway and holds none of the person's settings that would send them
+// elsewhere.
+func checkGatewayEnv(t *testing.T, env map[string]string) {
+	t.Helper()
+	if got, want := env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4100"; got != want {
+		t.Errorf("ANTHROPIC_BASE_URL = %q, want the gateway %q", got, want)
+	}
+	for _, name := range personElsewhere {
+		if value, ok := env[name]; ok {
+			t.Errorf("claude's environment has %s = %q, want it cleared", name, value)
+		}
+	}
+}
+
+// checkNoToken checks that the invocation token is not in the log.
+func checkNoToken(t *testing.T, log string) {
+	t.Helper()
+	if strings.Contains(log, token) {
+		t.Errorf("the log holds the invocation token:\n%s", log)
+	}
 }
 
 // checkRecord checks how the adapter ran claude.
@@ -164,10 +266,8 @@ func checkRecord(t *testing.T, r record, workspace string) {
 	if got, err := filepath.EvalSymlinks(r.Dir); err != nil || got != mustEval(t, workspace) {
 		t.Errorf("claude ran in %q, want the workspace %q", r.Dir, workspace)
 	}
-	if r.SignIn != "the sign-in of the machine" || r.BaseURL != "the machine's own" {
-		t.Errorf("claude's environment has sign-in %q and base URL %q, want the machine's own, unchanged", r.SignIn, r.BaseURL)
-	}
 	want := map[string]string{
+		"--model":              "frontier",
 		"--output-format":      "json",
 		"--json-schema":        `{"properties":{"summary":{"type":"string"}},"required":["summary"],"type":"object"}`,
 		"--max-budget-usd":     "1.500000",
@@ -348,8 +448,18 @@ func TestRunRefusesInvocation(t *testing.T) {
 	_, workspace := setup(t, "success")
 	noTask := invocation(workspace)
 	noTask.Input.Task = ""
-	gateway := invocation(workspace)
-	gateway.Gateway = &harnessv1.Gateway{BaseUrl: "http://127.0.0.1:1", Token: "t"}
+	noGateway := invocation(workspace)
+	noGateway.Gateway = nil
+	noBaseURL := invocation(workspace)
+	noBaseURL.Gateway.BaseUrl = ""
+	notHTTP := invocation(workspace)
+	notHTTP.Gateway.BaseUrl = "unix:///run/pumi.sock"
+	noToken := invocation(workspace)
+	noToken.Gateway.Token = ""
+	tokenWithNewline := invocation(workspace)
+	tokenWithNewline.Gateway.Token = token + "\nX-Other: 1"
+	noRole := invocation(workspace)
+	noRole.ModelRole = ""
 	tests := []struct {
 		name  string
 		input string
@@ -359,7 +469,12 @@ func TestRunRefusesInvocation(t *testing.T) {
 		{"not protojson", "{not json}\n", "invocation"},
 		{"unknown field", `{"invocation":"inv-1","newField":true}` + "\n", "newField"},
 		{"no task", line(t, noTask), "task"},
-		{"gateway", line(t, gateway), "gateway"},
+		{"no gateway", line(t, noGateway), "no model gateway"},
+		{"no base URL", line(t, noBaseURL), "base URL"},
+		{"base URL not HTTP", line(t, notHTTP), "base URL"},
+		{"no token", line(t, noToken), "token"},
+		{"token with a newline", line(t, tokenWithNewline), "token"},
+		{"no model role", line(t, noRole), "model role"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -371,6 +486,9 @@ func TestRunRefusesInvocation(t *testing.T) {
 			}
 			if !errors.Is(err, ErrInvocation) || !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("Run returned %v, want ErrInvocation about %q", err, tt.want)
+			}
+			if err != nil {
+				checkNoToken(t, err.Error())
 			}
 		})
 	}
