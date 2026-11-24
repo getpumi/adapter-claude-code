@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -26,18 +27,16 @@ const (
 	fakeOutput = "FAKE_CLAUDE_OUTPUT"
 	// fakeRecord is the directory in which the fake writes record.json.
 	fakeRecord = "FAKE_CLAUDE_RECORD"
-	// fakeSignIn stands for the sign-in that claude finds in its
-	// environment, which the adapter leaves as it is.
-	fakeSignIn = "FAKE_CLAUDE_SIGN_IN"
 )
 
 // record is what the fake writes when it starts: how the adapter ran it.
 type record struct {
-	Args    []string
-	Stdin   string
-	Dir     string
-	SignIn  string
-	BaseURL string
+	Args  []string
+	Stdin string
+	Dir   string
+	// Env holds the variables of claude's environment whose names start
+	// with ANTHROPIC_ or CLAUDE_CODE_.
+	Env map[string]string
 }
 
 // The fake's report, in the shape of claude -p --output-format json, with
@@ -73,12 +72,18 @@ func fakeClaude() int {
 		return 3
 	}
 	dir, _ := os.Getwd()
+	env := map[string]string{}
+	for _, kv := range os.Environ() {
+		name, value, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, "ANTHROPIC_") || strings.HasPrefix(name, "CLAUDE_CODE_") {
+			env[name] = value
+		}
+	}
 	data, err := json.Marshal(record{
-		Args:    os.Args[1:],
-		Stdin:   string(stdin),
-		Dir:     dir,
-		SignIn:  os.Getenv(fakeSignIn),
-		BaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
+		Args:  os.Args[1:],
+		Stdin: string(stdin),
+		Dir:   dir,
+		Env:   env,
 	})
 	if err != nil {
 		return 3
@@ -88,6 +93,9 @@ func fakeClaude() int {
 		return 3
 	}
 	_, _ = fmt.Fprintln(os.Stderr, "fake claude started")
+	// Claude Code writes this notice when --model names a model that it
+	// does not know, such as a model role, and then runs as usual.
+	_, _ = fmt.Fprintln(os.Stderr, `[claude-code:unrecognized_model] {"model":"frontier","query_source":"sdk"}`)
 	switch os.Getenv(fakeMode) {
 	case "success":
 		_, _ = fmt.Println(fakeResult("success", false, os.Getenv(fakeOutput)))

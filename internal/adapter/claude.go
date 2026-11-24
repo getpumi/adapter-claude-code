@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -78,6 +79,7 @@ func runClaude(ctx context.Context, cfg Config, inv *harnessv1.Invocation, args 
 		return nil
 	}
 	cmd.Dir = inv.GetWorkspace()
+	cmd.Env = Env(os.Environ(), inv.GetGateway())
 	cmd.Stdin = strings.NewReader(inv.GetInput().GetTask())
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
