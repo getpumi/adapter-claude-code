@@ -335,6 +335,7 @@ func TestRunFailed(t *testing.T) {
 		wantLog  string
 	}{
 		{"budget ran out", "budget", "", 250_000, "error_max_budget_usd"},
+		{"the API refused a call", "apierror", "", 250_000, "claude reported an error: " + fakeAPIError},
 		{"report is not JSON", "garbage", "", 0, "not a report"},
 		{"no structured output", "success", "", 250_000, "no structured output"},
 	}
