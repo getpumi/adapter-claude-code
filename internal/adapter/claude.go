@@ -13,14 +13,15 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	harnessv1 "getpumi.dev/pumi/api/gen/pumi/harness/v1"
 )
 
-// report is the part of claude's report, from claude -p --output-format
-// json, that the adapter reads. claude writes it when the run ends, also
-// when it ends because it was interrupted.
+// report is the part of claude's report, the result line of claude -p
+// --output-format stream-json, that the adapter reads. claude writes it
+// when the run ends, also when it ends because it was interrupted.
 type report struct {
 	Type             string                `json:"type"`
 	Subtype          string                `json:"subtype"`
@@ -30,6 +31,14 @@ type report struct {
 	TotalCostUSD     float64               `json:"total_cost_usd"`
 	ModelUsage       map[string]modelUsage `json:"modelUsage"`
 	StructuredOutput json.RawMessage       `json:"structured_output"`
+	// PermissionDenials are the tool calls that claude's settings refused.
+	PermissionDenials []denial `json:"permission_denials"`
+	// TerminalReason is why the run ended, such as "completed" or
+	// "api_error".
+	TerminalReason string `json:"terminal_reason"`
+	// APIErrorStatus is the HTTP status of the API's error that ended the
+	// run, such as 429.
+	APIErrorStatus int `json:"api_error_status"`
 }
 
 // modelUsage is claude's usage of one model.
@@ -38,6 +47,9 @@ type modelUsage struct {
 	OutputTokens             int64 `json:"outputTokens"`
 	CacheReadInputTokens     int64 `json:"cacheReadInputTokens"`
 	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens"`
+	CacheCreationFiveMinute  int64 `json:"cacheCreationEphemeral5mInputTokens"`
+	CacheCreationOneHour     int64 `json:"cacheCreationEphemeral1hInputTokens"`
+	WebSearchRequests        int64 `json:"webSearchRequests"`
 }
 
 // why is why the adapter stopped claude before it ended by itself.
@@ -51,9 +63,28 @@ const (
 	timeBudget
 )
 
-// runClaude runs claude and returns the result. It stops claude when closed
-// is closed, when ctx ends or when the time budget runs out.
-func runClaude(ctx context.Context, cfg Config, inv *harnessv1.Invocation, args []string, closed <-chan struct{}, stderr io.Writer) *harnessv1.Result {
+// versionTimeout is how long claude --version may take.
+const versionTimeout = 30 * time.Second
+
+// logVersion writes claude's version to the log, from claude --version
+// with the run's environment.
+func logVersion(ctx context.Context, path string, env []string, stderr io.Writer) {
+	ctx, cancel := context.WithTimeout(ctx, versionTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "--version")
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		logf(stderr, "claude --version failed: %v", err)
+		return
+	}
+	logf(stderr, "claude --version: %s", strings.TrimSpace(string(out)))
+}
+
+// runClaude runs claude and returns the result. It passes the usage of
+// each model call to stdout as claude reports it. It stops claude when
+// closed is closed, when ctx ends or when the time budget runs out.
+func runClaude(ctx context.Context, cfg Config, inv *harnessv1.Invocation, args []string, closed <-chan struct{}, stdout, stderr io.Writer) *harnessv1.Result {
 	program := cfg.Claude
 	if program == "" {
 		program = "claude"
@@ -67,6 +98,11 @@ func runClaude(ctx context.Context, cfg Config, inv *harnessv1.Invocation, args 
 		logf(stderr, "cannot find claude: %v", err)
 		return failed(nil, 0)
 	}
+	// claude's standard error and the stream's notes both go to the log,
+	// from two goroutines of the command.
+	stderr = &syncWriter{w: stderr}
+	env := Env(os.Environ(), inv.GetGateway())
+	logVersion(ctx, path, env, stderr)
 
 	// The arguments come from the invocation, which is what the adapter
 	// runs; no shell reads them, and the task goes to standard input.
@@ -80,10 +116,10 @@ func runClaude(ctx context.Context, cfg Config, inv *harnessv1.Invocation, args 
 		return nil
 	}
 	cmd.Dir = inv.GetWorkspace()
-	cmd.Env = Env(os.Environ(), inv.GetGateway())
+	cmd.Env = env
 	cmd.Stdin = strings.NewReader(inv.GetInput().GetTask())
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
+	s := newStream(stdout, stderr)
+	cmd.Stdout = s
 	cmd.Stderr = stderr
 	// A process that claude started can hold its standard error open after
 	// claude exits; Wait then stops waiting for it.
@@ -99,8 +135,8 @@ func runClaude(ctx context.Context, cfg Config, inv *harnessv1.Invocation, args 
 	go func() { done <- cmd.Wait() }()
 
 	var budget <-chan time.Time
-	if s := inv.GetBudget().GetSeconds(); s > 0 {
-		timer := time.NewTimer(time.Duration(s) * time.Second)
+	if sec := inv.GetBudget().GetSeconds(); sec > 0 {
+		timer := time.NewTimer(time.Duration(sec) * time.Second)
 		defer timer.Stop()
 		budget = timer.C
 	}
@@ -119,7 +155,12 @@ func runClaude(ctx context.Context, cfg Config, inv *harnessv1.Invocation, args 
 		err = wait(cmd, done, grace)
 	}
 	elapsed := time.Since(start)
-	return result(stdout.Bytes(), err, stopped, inv, elapsed, stderr)
+	r := s.finish()
+	res := result(r, s, err, stopped, inv, elapsed, stderr)
+	if s.writeErr != nil {
+		logf(stderr, "cannot write a usage figure: %v", s.writeErr)
+	}
+	return res
 }
 
 // wait waits for claude to exit after it was interrupted, and kills its
@@ -137,8 +178,9 @@ func wait(cmd *exec.Cmd, done <-chan error, grace time.Duration) error {
 	}
 }
 
-// result builds the result from claude's report.
-func result(out []byte, waitErr error, stopped why, inv *harnessv1.Invocation, elapsed time.Duration, stderr io.Writer) *harnessv1.Result {
+// result builds the result from claude's report r, which is nil when
+// claude wrote none, and from its stream s.
+func result(r *report, s *stream, waitErr error, stopped why, inv *harnessv1.Invocation, elapsed time.Duration, stderr io.Writer) *harnessv1.Result {
 	switch {
 	case stopped == stopRequested:
 		logf(stderr, "stopped claude on request")
@@ -148,68 +190,95 @@ func result(out []byte, waitErr error, stopped why, inv *harnessv1.Invocation, e
 		logf(stderr, "claude exited: %v", waitErr)
 	}
 	seconds := int64(math.Ceil(elapsed.Seconds()))
-	var r report
-	if err := json.Unmarshal(bytes.TrimSpace(out), &r); err != nil || r.Type != "result" {
-		if stopped == stopRequested {
-			return &harnessv1.Result{Status: harnessv1.Result_STATUS_STOPPED, Usage: &harnessv1.Usage{Seconds: seconds}}
-		}
-		logf(stderr, "claude's standard output is not a report: %q", clip(out))
-		return failed(nil, seconds)
-	}
+	res := &harnessv1.Result{Status: harnessv1.Result_STATUS_FAILED, Usage: r.usage(s, seconds), Refusals: r.refusals(stderr)}
 	switch {
 	case stopped == stopRequested:
-		return &harnessv1.Result{Status: harnessv1.Result_STATUS_STOPPED, Usage: r.usage(seconds)}
+		res.Status = harnessv1.Result_STATUS_STOPPED
+	case limited(r, s):
+		logf(stderr, "the provider's usage or rate limit refused a call of claude: %s", clip([]byte(r.message())))
+		res.Status = harnessv1.Result_STATUS_LIMITED
+	case r == nil:
+		logf(stderr, "claude wrote no report")
 	case stopped == timeBudget:
-		return failed(&r, seconds)
 	case r.Subtype != "success":
 		logf(stderr, "claude reported %s: %s", r.Subtype, strings.Join(r.Errors, "; "))
-		return failed(&r, seconds)
 	case r.IsError:
 		// claude reports an error of the API, such as a call that the
 		// model gateway refused at the invocation's cap, with the subtype
 		// success and the error in result.
 		logf(stderr, "claude reported an error: %s", clip([]byte(r.Result)))
-		return failed(&r, seconds)
+	case inv.GetOutputSchema().GetJsonSchema() == "":
+		res.Status = harnessv1.Result_STATUS_COMPLETED
+	default:
+		var output bytes.Buffer
+		if len(r.StructuredOutput) == 0 || string(r.StructuredOutput) == "null" || json.Compact(&output, r.StructuredOutput) != nil {
+			logf(stderr, "claude reported no structured output")
+			break
+		}
+		res.Status, res.Output = harnessv1.Result_STATUS_COMPLETED, output.String()
 	}
-	if inv.GetOutputSchema().GetJsonSchema() == "" {
-		return &harnessv1.Result{Status: harnessv1.Result_STATUS_COMPLETED, Usage: r.usage(seconds)}
-	}
-	var output bytes.Buffer
-	if len(r.StructuredOutput) == 0 || string(r.StructuredOutput) == "null" || json.Compact(&output, r.StructuredOutput) != nil {
-		logf(stderr, "claude reported no structured output")
-		return failed(&r, seconds)
-	}
-	return &harnessv1.Result{
-		Status: harnessv1.Result_STATUS_COMPLETED,
-		Output: output.String(),
-		Usage:  r.usage(seconds),
-	}
+	return res
 }
 
-// failed is a failed result, with the usage of the report when there is
-// one.
+// limited reports whether a provider's usage or rate limit ended the run:
+// the run did not succeed, and claude reported a limit that refused a
+// call, as a rate_limit_event whose status is rejected or an API error with
+// the status 429 (decision 0249). A limit that claude waited out, after
+// which the run succeeded, does not count.
+func limited(r *report, s *stream) bool {
+	if r != nil && r.Subtype == "success" && !r.IsError {
+		return false
+	}
+	return s.rejected || (r != nil && r.APIErrorStatus == 429)
+}
+
+// message is what the report says about how the run ended.
+func (r *report) message() string {
+	if r == nil {
+		return "claude wrote no report"
+	}
+	if r.Result != "" {
+		return r.Result
+	}
+	return strings.Join(r.Errors, "; ")
+}
+
+// failed is a failed result with the wall time only.
 func failed(r *report, seconds int64) *harnessv1.Result {
-	usage := &harnessv1.Usage{Seconds: seconds}
-	if r != nil {
-		usage = r.usage(seconds)
-	}
-	return &harnessv1.Result{Status: harnessv1.Result_STATUS_FAILED, Usage: usage}
+	return &harnessv1.Result{Status: harnessv1.Result_STATUS_FAILED, Usage: r.usage(nil, seconds)}
 }
 
-// usage is the report's usage. The tokens are every token of every model
+// usage is the run's usage. The tokens are every token of every model
 // that the run used: input, output, and input written to and read from the
-// prompt cache. The cost is claude's total cost, rounded to a microdollar.
-// The seconds are the wall time of claude's process, rounded up.
-func (r *report) usage(seconds int64) *harnessv1.Usage {
-	var tokens int64
+// prompt cache, from the report, or from what the stream passed when
+// claude wrote no report. The cost is claude's total cost, rounded to a
+// microdollar. The seconds are the wall time of claude's process, rounded
+// up.
+func (r *report) usage(s *stream, seconds int64) *harnessv1.Usage {
+	u := &harnessv1.Usage{Seconds: seconds}
+	if r == nil {
+		if s != nil {
+			u.Tokens = s.tokens()
+		}
+		return u
+	}
 	for _, m := range r.ModelUsage {
-		tokens += m.InputTokens + m.OutputTokens + m.CacheReadInputTokens + m.CacheCreationInputTokens
+		u.Tokens += m.InputTokens + m.OutputTokens + m.CacheReadInputTokens + m.CacheCreationInputTokens
 	}
-	return &harnessv1.Usage{
-		Tokens:           tokens,
-		CostMicrodollars: int64(math.Round(r.TotalCostUSD * 1e6)),
-		Seconds:          seconds,
-	}
+	u.CostMicrodollars = int64(math.Round(r.TotalCostUSD * 1e6))
+	return u
+}
+
+// syncWriter makes the writes to w one at a time.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 // clip shortens claude's output for the log.

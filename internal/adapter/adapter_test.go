@@ -55,23 +55,35 @@ func setup(t *testing.T, mode string) (recordDir, workspace string) {
 // machine is the person's own provider settings and credentials, which the
 // tests put in the adapter's environment.
 var machine = map[string]string{
-	"ANTHROPIC_BASE_URL":                     "https://elsewhere.example",
-	"ANTHROPIC_CUSTOM_HEADERS":               "X-Elsewhere: 1",
-	"ANTHROPIC_MODEL":                        "claude-opus-5-5",
-	"ANTHROPIC_SMALL_FAST_MODEL":             "claude-haiku-5-5",
-	"ANTHROPIC_DEFAULT_SONNET_MODEL":         "claude-sonnet-5-5",
-	"ANTHROPIC_VERTEX_BASE_URL":              "https://vertex.example",
-	"CLAUDE_CODE_SUBAGENT_MODEL":             "haiku",
-	"CLAUDE_CODE_USE_BEDROCK":                "1",
-	"CLAUDE_CODE_USE_VERTEX":                 "1",
-	"CLAUDE_CODE_USE_FOUNDRY":                "1",
-	"CLAUDE_CODE_USE_MANTLE":                 "1",
-	"CLAUDE_CODE_USE_ANTHROPIC_AWS":          "1",
-	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD": "1",
-	"ANTHROPIC_API_KEY":                      "the person's API key",
-	"ANTHROPIC_AUTH_TOKEN":                   "the person's bearer token",
-	"CLAUDE_CODE_OAUTH_TOKEN":                "the person's sign-in",
+	"ANTHROPIC_BASE_URL":                                 "https://elsewhere.example",
+	"ANTHROPIC_CUSTOM_HEADERS":                           "X-Elsewhere: 1",
+	"ANTHROPIC_MODEL":                                    "claude-opus-5-5",
+	"ANTHROPIC_SMALL_FAST_MODEL":                         "claude-haiku-5-5",
+	"ANTHROPIC_DEFAULT_SONNET_MODEL":                     "claude-sonnet-5-5",
+	"ANTHROPIC_VERTEX_BASE_URL":                          "https://vertex.example",
+	"CLAUDE_CODE_SUBAGENT_MODEL":                         "haiku",
+	"CLAUDE_CODE_USE_BEDROCK":                            "1",
+	"CLAUDE_CODE_USE_VERTEX":                             "1",
+	"CLAUDE_CODE_USE_FOUNDRY":                            "1",
+	"CLAUDE_CODE_USE_MANTLE":                             "1",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS":                      "1",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD":             "1",
+	"ANTHROPIC_API_KEY":                                  "the person's API key",
+	"ANTHROPIC_AUTH_TOKEN":                               "the person's bearer token",
+	"CLAUDE_CODE_OAUTH_TOKEN":                            "the person's sign-in",
+	"CLAUDE_CODE_RETRY_WATCHDOG":                         "1",
+	"CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS":             "1200000",
+	"CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS": "90000",
 }
+
+// personWaits are the variables of the person's settings with which claude
+// waits out a provider's limit, which the adapter clears on both paths
+// (decision 0249).
+var personWaits = []string{"CLAUDE_CODE_RETRY_WATCHDOG", "CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS", "CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS"}
+
+// personModels are the variables of the person's settings that would send
+// claude's calls to other models, which the adapter clears on both paths.
+var personModels = []string{"ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"}
 
 // personSignIns are the variables of the person's own credentials, which stay
 // when the harness keeps its sign-in.
@@ -122,13 +134,30 @@ func line(t *testing.T, inv *harnessv1.Invocation) string {
 // stays open until the adapter returns, as the runner keeps it.
 func run(t *testing.T, input string) (*harnessv1.Result, string, error) {
 	t.Helper()
+	result, _, stderr, err := runFigures(t, input)
+	return result, stderr, err
+}
+
+// runFigures is run, and also returns the usage figures that the adapter
+// wrote before the result.
+func runFigures(t *testing.T, input string) (*harnessv1.Result, []*harnessv1.UsageFigure, string, error) {
+	t.Helper()
 	stdin, w := io.Pipe()
 	go func() { _, _ = io.WriteString(w, input) }()
 	defer func() { _ = w.Close() }()
-	return runWith(t, Config{}, stdin)
+	return runLines(t, Config{}, stdin)
 }
 
 func runWith(t *testing.T, cfg Config, stdin io.Reader) (*harnessv1.Result, string, error) {
+	t.Helper()
+	result, _, stderr, err := runLines(t, cfg, stdin)
+	return result, stderr, err
+}
+
+// runLines runs the adapter and reads its standard output as the runner
+// does: lines of pumi.harness.v1.Line, usage figures and then exactly one
+// result, which is the last line (decision 0252).
+func runLines(t *testing.T, cfg Config, stdin io.Reader) (*harnessv1.Result, []*harnessv1.UsageFigure, string, error) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	err := Run(t.Context(), cfg, stdin, &stdout, &stderr)
@@ -136,13 +165,30 @@ func runWith(t *testing.T, cfg Config, stdin io.Reader) (*harnessv1.Result, stri
 		if stdout.Len() != 0 {
 			t.Errorf("Run returned %v and wrote %q", err, stdout.String())
 		}
-		return nil, stderr.String(), err
+		return nil, nil, stderr.String(), err
 	}
-	var result harnessv1.Result
-	if err := protojson.Unmarshal(stdout.Bytes(), &result); err != nil {
-		t.Fatalf("the standard output %q is not a Result: %v", stdout.String(), err)
+	var result *harnessv1.Result
+	var figures []*harnessv1.UsageFigure
+	for i, text := range strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n") {
+		l := &harnessv1.Line{}
+		if err := protojson.Unmarshal([]byte(text), l); err != nil {
+			t.Fatalf("line %d of the standard output, %q, is not a pumi.harness.v1.Line: %v", i+1, text, err)
+		}
+		switch {
+		case result != nil:
+			t.Fatalf("line %d of the standard output, %q, comes after the result", i+1, text)
+		case l.GetResult() != nil:
+			result = l.GetResult()
+		case l.GetUsage() != nil:
+			figures = append(figures, l.GetUsage())
+		default:
+			t.Fatalf("line %d of the standard output, %q, holds neither a usage figure nor a result", i+1, text)
+		}
 	}
-	return &result, stderr.String(), nil
+	if result == nil {
+		t.Fatalf("the standard output %q has no result", stdout.String())
+	}
+	return result, figures, stderr.String(), nil
 }
 
 func readRecord(t *testing.T, dir string) record {
@@ -242,7 +288,7 @@ func checkGatewayEnv(t *testing.T, env map[string]string) {
 	if got, want := env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4100"; got != want {
 		t.Errorf("ANTHROPIC_BASE_URL = %q, want the gateway %q", got, want)
 	}
-	for _, name := range personElsewhere {
+	for _, name := range slices.Concat(personElsewhere, personWaits) {
 		if value, ok := env[name]; ok {
 			t.Errorf("claude's environment has %s = %q, want it cleared", name, value)
 		}
@@ -268,7 +314,7 @@ func checkRecord(t *testing.T, r record, workspace string) {
 	}
 	want := map[string]string{
 		"--model":              "frontier",
-		"--output-format":      "json",
+		"--output-format":      "stream-json",
 		"--json-schema":        `{"properties":{"summary":{"type":"string"}},"required":["summary"],"type":"object"}`,
 		"--max-budget-usd":     "1.500000",
 		"--permission-mode":    "dontAsk",
@@ -281,7 +327,7 @@ func checkRecord(t *testing.T, r record, workspace string) {
 			t.Errorf("claude's flag %s = %q (present %t), want %q; args %q", name, got, ok, value, r.Args)
 		}
 	}
-	for _, name := range []string{"-p", "--no-session-persistence"} {
+	for _, name := range []string{"-p", "--no-session-persistence", "--verbose", "--include-partial-messages"} {
 		if !slices.Contains(r.Args, name) {
 			t.Errorf("claude's args %q do not hold %s", r.Args, name)
 		}
@@ -336,7 +382,7 @@ func TestRunFailed(t *testing.T) {
 	}{
 		{"budget ran out", "budget", "", 250_000, "error_max_budget_usd"},
 		{"the API refused a call", "apierror", "", 250_000, "claude reported an error: " + fakeAPIError},
-		{"report is not JSON", "garbage", "", 0, "not a report"},
+		{"stream is not JSON", "garbage", "", 0, "no report"},
 		{"no structured output", "success", "", 250_000, "no structured output"},
 	}
 	for _, tt := range tests {
@@ -470,7 +516,7 @@ func TestRunRefusesInvocation(t *testing.T) {
 		{"not protojson", "{not json}\n", "invocation"},
 		{"unknown field", `{"invocation":"inv-1","newField":true}` + "\n", "newField"},
 		{"no task", line(t, noTask), "task"},
-		{"no gateway", line(t, noGateway), "no model gateway"},
+		{"no gateway and no model", line(t, noGateway), "neither a model gateway nor a model"},
 		{"no base URL", line(t, noBaseURL), "base URL"},
 		{"base URL not HTTP", line(t, notHTTP), "base URL"},
 		{"no token", line(t, noToken), "token"},

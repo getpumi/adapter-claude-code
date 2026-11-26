@@ -61,6 +61,20 @@ func TestTranslate(t *testing.T) {
 			wantDeny:  []string{"Edit", "Glob", "Grep", "NotebookEdit", "Read", "WebFetch", "WebSearch", "Write"},
 		},
 		{
+			// An entry that begins with assignments is translated as
+			// written, so it allows exactly those assignments (decision
+			// 0248); the conformance suite checks what claude then
+			// allows and refuses.
+			name: "commands with assignments",
+			caps: &harnessv1.Capabilities{
+				Tools:    []harnessv1.Capabilities_ToolKind{run},
+				Commands: []string{"GOWORK=off go test", "A=1 B=2 make"},
+			},
+			wantTools: []string{"Bash"},
+			wantAllow: []string{"Bash(A=1 B=2 make *)", "Bash(A=1 B=2 make)", "Bash(GOWORK=off go test *)", "Bash(GOWORK=off go test)"},
+			wantDeny:  []string{"Edit", "Glob", "Grep", "NotebookEdit", "Read", "WebFetch", "WebSearch", "Write"},
+		},
+		{
 			name:      "web with no network",
 			caps:      &harnessv1.Capabilities{Tools: []harnessv1.Capabilities_ToolKind{web}, Network: network(harnessv1.Capabilities_Network_ACCESS_NONE)},
 			wantTools: []string{},

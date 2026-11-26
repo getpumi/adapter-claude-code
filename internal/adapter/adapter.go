@@ -45,8 +45,9 @@ type Config struct {
 
 // Run runs one invocation. It returns an error, and writes nothing to
 // stdout, only when the invocation cannot be read or cannot be run; the
-// error then wraps ErrInvocation. Otherwise it writes one Result, also when
-// claude fails, and returns nil. stderr is the log.
+// error then wraps ErrInvocation. Otherwise it writes a usage figure for
+// each model call and then one Result, each as a pumi.harness.v1.Line,
+// also when claude fails, and returns nil. stderr is the log.
 func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io.Writer) error {
 	inv, closed, err := readInvocation(stdin)
 	if err != nil {
@@ -56,8 +57,8 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io.Wri
 	if err != nil {
 		return err
 	}
-	result := runClaude(ctx, cfg, inv, args, closed, stderr)
-	data, err := protojson.Marshal(result)
+	result := runClaude(ctx, cfg, inv, args, closed, stdout, stderr)
+	data, err := protojson.Marshal(&harnessv1.Line{Kind: &harnessv1.Line_Result{Result: result}})
 	if err != nil {
 		return err
 	}
@@ -96,28 +97,34 @@ func readInvocation(stdin io.Reader) (*harnessv1.Invocation, <-chan struct{}, er
 // the task, which claude reads from its standard input, so that a task that
 // starts with "-" is not read as a flag.
 //
+//   - --output-format stream-json with --verbose and
+//     --include-partial-messages writes the events of each model call as
+//     they happen, so that the adapter passes each call's usage at once
+//     (decision 0241).
 //   - --setting-sources "" ignores the user's settings and the settings
 //     files in the workspace, so that only --settings sets the permissions.
 //   - --permission-mode dontAsk and --permission-prompts none deny what no
 //     rule allows, with no prompt.
 //   - --no-session-persistence keeps no session to resume.
-//   - --model asks for the invocation's model role by name, such as
-//     "frontier", which the gateway maps to a model (decision 0233).
-//     Claude Code writes an unrecognized_model notice to its log for a name
-//     it does not know and runs as usual.
+//   - Through the model gateway, --model asks for the invocation's model
+//     role by name, such as "frontier", which the gateway maps to a model
+//     (decision 0233), and --max-budget-usd passes the cost budget. Claude
+//     Code writes an unrecognized_model notice to its log for a name it
+//     does not know and runs as usual.
+//   - On the sign-in path, --model asks for the model of the role and
+//     --fallback-model for the model of its fallback, when there is one
+//     (decision 0254). The runner counts and caps the usage, so claude gets
+//     no budget of its own that could end the run first (decision 0241).
 //
-// Every agent run goes through the model gateway (decision 0226), so an
-// invocation without one, or without a model role, is refused. Env sets
-// claude's environment for the gateway.
+// An agent run with a gateway needs a model role, and one without needs a
+// model. Env sets claude's environment.
 func Args(inv *harnessv1.Invocation) ([]string, error) {
 	if inv.GetInput().GetTask() == "" {
 		return nil, fmt.Errorf("%w: it has no task", ErrInvocation)
 	}
-	if err := checkGateway(inv.GetGateway()); err != nil {
+	models, err := modelArgs(inv)
+	if err != nil {
 		return nil, err
-	}
-	if inv.GetModelRole() == "" {
-		return nil, fmt.Errorf("%w: it has no model role, which every agent run names (decision 0233)", ErrInvocation)
 	}
 	tools, settings := Translate(inv.GetCapabilities())
 	data, err := json.Marshal(settings)
@@ -126,15 +133,19 @@ func Args(inv *harnessv1.Invocation) ([]string, error) {
 	}
 	args := []string{
 		"-p",
-		"--output-format", "json",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--include-partial-messages",
 		"--no-session-persistence",
-		"--model", inv.GetModelRole(),
+	}
+	args = append(args, models...)
+	args = append(args,
 		"--setting-sources", "",
 		"--permission-mode", "dontAsk",
 		"--permission-prompts", "none",
 		"--tools", strings.Join(tools, ","),
 		"--settings", string(data),
-	}
+	)
 	if schema := inv.GetOutputSchema().GetJsonSchema(); schema != "" {
 		schema, err := claudeSchema(schema)
 		if err != nil {
@@ -142,8 +153,30 @@ func Args(inv *harnessv1.Invocation) ([]string, error) {
 		}
 		args = append(args, "--json-schema", schema)
 	}
-	if cost := inv.GetBudget().GetCostMicrodollars(); cost > 0 {
+	if cost := inv.GetBudget().GetCostMicrodollars(); cost > 0 && inv.GetGateway() != nil {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%d.%06d", cost/1_000_000, cost%1_000_000))
+	}
+	return args, nil
+}
+
+// modelArgs returns the arguments that name claude's models: the model
+// role through the gateway, or the models of the role on the sign-in path.
+func modelArgs(inv *harnessv1.Invocation) ([]string, error) {
+	if inv.GetGateway() != nil {
+		if err := checkGateway(inv.GetGateway()); err != nil {
+			return nil, err
+		}
+		if inv.GetModelRole() == "" {
+			return nil, fmt.Errorf("%w: it has a model gateway but no model role, which the gateway maps (decision 0233)", ErrInvocation)
+		}
+		return []string{"--model", inv.GetModelRole()}, nil
+	}
+	if inv.GetModel() == "" {
+		return nil, fmt.Errorf("%w: it has neither a model gateway nor a model, which the runner gives on the sign-in path (decision 0254)", ErrInvocation)
+	}
+	args := []string{"--model", inv.GetModel()}
+	if f := inv.GetFallbackModel(); f != "" {
+		args = append(args, "--fallback-model", f)
 	}
 	return args, nil
 }
