@@ -17,10 +17,10 @@ import (
 const InvocationHeader = "X-Pumi-Token"
 
 // elsewhere are the variables of the person's own provider settings that
-// would send claude's calls somewhere other than the gateway, or to a model
-// other than the invocation's model role (decisions 0226 and 0233). The
-// adapter clears them on both credential paths. The names are from the
-// Claude Code documentation of its environment variables.
+// would send claude's calls somewhere other than the gateway (decision
+// 0226). The adapter clears them when the invocation has a gateway. The
+// names are from the Claude Code documentation of its environment
+// variables.
 var elsewhere = []string{
 	"ANTHROPIC_BASE_URL",
 	"ANTHROPIC_CUSTOM_HEADERS",
@@ -36,6 +36,15 @@ var elsewhere = []string{
 	"ANTHROPIC_FOUNDRY_BASE_URL",
 	"ANTHROPIC_AWS_BASE_URL",
 	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+}
+
+// otherModels are the variables of the person's own settings that would
+// send claude's calls to a model other than the one the invocation names:
+// the model role through the gateway (decision 0233), or the role's model
+// on the sign-in path (decision 0254). The adapter clears them on both
+// paths. The names are from the Claude Code documentation of its
+// environment variables.
+var otherModels = []string{
 	"ANTHROPIC_MODEL",
 	"ANTHROPIC_DEFAULT_MODEL",
 	"ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -44,6 +53,21 @@ var elsewhere = []string{
 	"ANTHROPIC_DEFAULT_FABLE_MODEL",
 	"ANTHROPIC_SMALL_FAST_MODEL",
 	"CLAUDE_CODE_SUBAGENT_MODEL",
+}
+
+// waitsOutLimits are the variables of claude's settings that make it wait
+// out a provider's usage or rate limit instead of stopping, which the
+// adapter clears on both paths (decision 0249). The names are from
+// Claude Code 2.1.332, in whose binary they are; a cloud container of
+// Claude Code sets the first three, and claude then waited more than two
+// minutes on a retry-after of one hour (decision 0249).
+var waitsOutLimits = []string{
+	"CLAUDE_CODE_RETRY_WATCHDOG",
+	"CLAUDE_CODE_RETRY_WATCHDOG_MAX_WAIT_MS",
+	"CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS",
+	"CLAUDE_CODE_RETRY_WATCHDOG_USAGE_LIMIT_RECHECK_MS",
+	"CLAUDE_CODE_RETRY_WATCHDOG_SCOPE",
+	"CLAUDE_CODE_DESKTOP_WORKFLOW_LIMIT_WAIT",
 }
 
 // signIns are the variables of the person's own credentials. The adapter
@@ -85,15 +109,26 @@ func checkGateway(gw *harnessv1.Gateway) error {
 }
 
 // Env returns claude's environment: the adapter's environment without the
-// person's provider settings that would send calls elsewhere, with claude's
-// calls sent to the gateway (decision 0225). When the gateway holds the
-// provider's API key, claude has no sign-in of its own and sends the token
-// as its bearer token. When the harness keeps its sign-in, claude sends the
-// sign-in, and the token in the header X-Pumi-Token.
+// person's settings that would send calls to another model or wait out a
+// provider's limit.
+//
+// With a gateway, it also leaves out the person's provider settings that
+// would send calls elsewhere, and sends claude's calls to the gateway
+// (decision 0225). When the gateway holds the provider's API key, claude
+// has no sign-in of its own and sends the token as its bearer token. When
+// the harness keeps its sign-in, claude sends the sign-in, and the token in
+// the header X-Pumi-Token.
+//
+// Without a gateway, on the sign-in path, claude keeps the person's own
+// sign-in and provider settings and talks to the provider directly
+// (decision 0240).
 func Env(environ []string, gw *harnessv1.Gateway) []string {
-	cleared := elsewhere
-	if !gw.GetKeepsSignIn() {
-		cleared = append(slices.Clone(elsewhere), signIns...)
+	cleared := slices.Concat(otherModels, waitsOutLimits)
+	if gw != nil {
+		cleared = append(cleared, elsewhere...)
+	}
+	if gw != nil && !gw.GetKeepsSignIn() {
+		cleared = append(cleared, signIns...)
 	}
 	env := make([]string, 0, len(environ)+2)
 	for _, kv := range environ {
@@ -101,6 +136,9 @@ func Env(environ []string, gw *harnessv1.Gateway) []string {
 		if !slices.Contains(cleared, name) {
 			env = append(env, kv)
 		}
+	}
+	if gw == nil {
+		return env
 	}
 	env = append(env, "ANTHROPIC_BASE_URL="+gw.GetBaseUrl())
 	if gw.GetKeepsSignIn() {
