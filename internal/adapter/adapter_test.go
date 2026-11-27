@@ -253,6 +253,25 @@ func TestRunCompleted(t *testing.T) {
 	}
 }
 
+// TestRunAcceptsTheBaseTree: the adapter reads an invocation whose input
+// names the plan's base tree, as the runner of getpumi/pumi writes it since
+// decision 0285, and runs it.
+func TestRunAcceptsTheBaseTree(t *testing.T) {
+	_, workspace := setup(t, "success")
+	in := line(t, invocation(workspace))
+	withBase := strings.Replace(in, `"tree":"tree"`, `"tree":"tree","baseTree":"base"`, 1)
+	if withBase == in {
+		t.Fatalf("the invocation line has no input tree to add the base tree to: %s", in)
+	}
+	result, stderr, err := run(t, withBase)
+	if err != nil {
+		t.Fatalf("Run of an invocation with a base tree: %v\n%s", err, stderr)
+	}
+	if result.GetStatus() != harnessv1.Result_STATUS_COMPLETED {
+		t.Errorf("status = %v, want completed\n%s", result.GetStatus(), stderr)
+	}
+}
+
 // TestRunWithAPIKeyInGateway runs an invocation whose gateway holds the
 // provider's API key, so that claude has no sign-in of its own and sends
 // the token as its credential (decision 0225).
