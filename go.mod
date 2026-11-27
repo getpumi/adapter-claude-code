@@ -8,7 +8,7 @@ go 1.27.0
 toolchain go1.27.4
 
 require (
-	getpumi.dev/pumi/api v0.0.0-20261126011027-b2747ad72a4e
-	getpumi.dev/pumi/conformance v0.0.0-20261126011027-b2747ad72a4e
+	getpumi.dev/pumi/api v0.0.0-20261127014228-c2b3742c1a67
+	getpumi.dev/pumi/conformance v0.0.0-20261127014228-c2b3742c1a67
 	google.golang.org/protobuf v1.36.12
 )
